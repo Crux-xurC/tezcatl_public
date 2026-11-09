@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# db -- Tezcatl's own MariaDB (D-db-backend), run as this user in the
+# foreground, so Poca's box can start and stop it like the other backends.
+# Separate from any MariaDB the system runs (its own data directory and port).
+#
+#   nix/db         start the server on 127.0.0.1:$TEZCATL_DB_PORT; TERM or
+#                  Ctrl+C stops it (MariaDB shuts down cleanly on TERM)
+#   nix/db init    once: make the data directory, then the account
+#                  $TEZCATL_DB_USER (password $TEZCATL_DB_PASSWORD, given on the
+#                  command line for init only, never in local.env) and its
+#                  databases $TEZCATL_DB_NAME and tezcatl_e2e. Starts nothing
+#                  if the data directory is there already
+#
+# Read from local.env: TEZCATL_DB_PORT, TEZCATL_DB_USER,
+# TEZCATL_DB_NAME, and TEZCATL_DB_DIR (the data directory; default
+# ~/.local/state/tezcatl/mariadb). The server's socket and pid file are in it.
+# The account the system's user gets from `init` (this user, by unix_socket)
+# is the administrator: `mariadb -S <dir>/mariadb.sock`.
+#
+# The programs are the system's (/usr/bin/mariadbd, mariadb-install-db,
+# mariadb), not Nix's.
+
+set -u
+
+TEZCATL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$TEZCATL_DIR/local.env" ]; then . "$TEZCATL_DIR/local.env"; fi
+
+DIR="${TEZCATL_DB_DIR:-$HOME/.local/state/tezcatl/mariadb}"
+PORT="${TEZCATL_DB_PORT:-3307}"
+SOCK="$DIR/mariadb.sock"
+
+serve() {
+  # --no-defaults first: no /etc/my.cnf, nothing of the system's server
+  exec mariadbd --no-defaults --datadir="$DIR" --socket="$SOCK" --pid-file="$DIR/mariadbd.pid" \
+    --bind-address=127.0.0.1 --port="$PORT" --skip-name-resolve \
+    --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci "$@"
+}
+
+up() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+case "$*" in
+  "")
+    if [ ! -d "$DIR/mysql" ]; then
+      echo "db: no data directory at $DIR -- run 'nix/db init' once." >&2
+      exit 1
+    fi
+    if up "$PORT"; then
+      echo "db: :$PORT is in use -- nothing started." >&2
+      exit 1
+    fi
+    echo "db: MariaDB on 127.0.0.1:$PORT, data $DIR"
+    serve
+    ;;
+  init)
+    if [ -e "$DIR/mysql" ]; then
+      echo "db: $DIR is there already -- nothing done." >&2
+      exit 1
+    fi
+    for v in TEZCATL_DB_USER TEZCATL_DB_PASSWORD; do
+      if [ -z "${!v:-}" ]; then echo "db: $v is not set (TEZCATL_DB_USER in local.env; TEZCATL_DB_PASSWORD=... nix/db init)" >&2; exit 1; fi
+    done
+    case "$TEZCATL_DB_USER$TEZCATL_DB_PASSWORD${TEZCATL_DB_NAME:-tezcatl}" in
+      *\'*|*\\*) echo "db: no ' or \\ in the account, its password or the database name" >&2; exit 1 ;;
+    esac
+    mkdir -p "$DIR" && chmod 700 "$DIR" || exit 1
+    mariadb-install-db --no-defaults --datadir="$DIR" --auth-root-authentication-method=socket \
+      --skip-test-db >"$DIR/install.log" 2>&1 || { echo "db: mariadb-install-db failed -- $DIR/install.log" >&2; exit 1; }
+    # the server only on its socket while the account is made
+    serve --skip-networking >"$DIR/init.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    db="${TEZCATL_DB_NAME:-tezcatl}"
+    mariadb --no-defaults -S "$SOCK" -u "$USER" <<SQL
+create database if not exists \`$db\` character set utf8mb4;
+create database if not exists \`tezcatl_e2e\` character set utf8mb4;
+create user '$TEZCATL_DB_USER'@'127.0.0.1' identified by '$TEZCATL_DB_PASSWORD';
+grant all privileges on \`$db\`.* to '$TEZCATL_DB_USER'@'127.0.0.1';
+grant all privileges on \`tezcatl_e2e\`.* to '$TEZCATL_DB_USER'@'127.0.0.1';
+SQL
+    status=$?
+    kill -TERM "$pid"
+    wait "$pid"
+    if [ "$status" != 0 ]; then echo "db: making the account failed -- $DIR/init.log" >&2; exit 1; fi
+    echo "db: ready -- $DIR ($TEZCATL_DB_USER on $db and tezcatl_e2e). Start it with nix/db (Poca's box: mariadb)."
+    ;;
+  *)
+    echo "usage: db [init]   (starts Tezcatl's MariaDB on 127.0.0.1:\$TEZCATL_DB_PORT in the foreground; init once first)" >&2
+    exit 2
+    ;;
+esac

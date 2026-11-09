@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# t -- bring tezcatl up: the static pages (:4001) and the relay (:4100), and
+# nothing else. It opens no browser; the page is reachable at
+# http://127.0.0.1:4001/main.html for whatever opens it (Poca).
+#
+# It stays in the foreground; Ctrl+C, TERM or HUP (closing the terminal)
+# stops both. It refuses to start anything when one of the ports is in use.
+#
+# The relay checks Poca's secret (D-poca-secret): Poca starts this with
+# POCA_SECRET. Without one, t starts nothing unless `t --no-auth` says to run
+# without authentication (then any local page can use the relay, as before).
+#
+# The backends are started on their own, by whoever starts tezcatl (Poca's
+# box, or a terminal); the relay reconnects to them once they are up:
+#   emacs-vent (:4000)   an Emacs with emacs-vent loaded (e.g. emacs --fg-daemon)
+#   Xipe Totec (:4200)   see its repository (xipe start)
+#   MariaDB (:3307)      nix/db (the relay's /sql, for database windows a person logs in to)
+#
+# The devShell's `t` calls this; an outside launcher runs it directly:
+#   nix develop /path/to/tezcatl --command /path/to/tezcatl/nix/t
+# It finds the repository from its own place, so it runs from anywhere.
+#
+# Logs: /tmp/tezcatl-{http,relay}.log.
+
+set -u
+
+TEZCATL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TEZCATL_DIR
+# this machine's own settings (git-ignored), e.g. TEZCATL_FS_ROOT -- read
+# here too, for a launcher that runs this from another directory
+if [ -f "$TEZCATL_DIR/local.env" ]; then . "$TEZCATL_DIR/local.env"; fi
+
+STOP_GRACE=10   # seconds a service gets to stop on TERM before KILL
+
+up() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# One service, its output to its log. `exec` keeps the pid the service's own.
+run_pages() {
+  cd "$TEZCATL_DIR" && exec python3 -m http.server --bind 127.0.0.1 --directory "$TEZCATL_DIR" 4001 >/tmp/tezcatl-http.log 2>&1
+}
+run_relay() {
+  cd "$TEZCATL_DIR" && exec elixir main.exs >/tmp/tezcatl-relay.log 2>&1
+}
+
+declare -A NAMES=()
+
+stop_all() {
+  trap - INT TERM HUP
+  echo
+  echo "t: stopping ${NAMES[*]}"
+  local pid
+  for pid in "${!NAMES[@]}"; do kill -TERM "$pid" 2>/dev/null; done
+  local waited=0
+  while [ "$waited" -lt $((STOP_GRACE * 10)) ]; do
+    local alive=0
+    for pid in "${!NAMES[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" = 0 ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  for pid in "${!NAMES[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "t: ${NAMES[$pid]} did not stop in ${STOP_GRACE}s -- killed"
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  done
+  wait "${!NAMES[@]}" 2>/dev/null
+  echo "t: stopped"
+  exit 0
+}
+
+case "$*" in
+  "") ;;
+  --no-auth) export TEZCATL_AUTH=off ;;
+  *)
+    echo "usage: t [--no-auth]   (starts the pages :4001 and the relay :4100 in the foreground; Ctrl+C stops both)" >&2
+    exit 2
+    ;;
+esac
+if [ -z "${POCA_SECRET:-}" ] && [ "${TEZCATL_AUTH:-}" != off ]; then
+  echo "t: no POCA_SECRET -- start tezcatl from Poca's box, or run 't --no-auth' to go without authentication." >&2
+  echo "t: nothing started." >&2
+  exit 1
+fi
+
+busy=""
+up 4001 && busy="$busy :4001(pages)"
+up 4100 && busy="$busy :4100(relay)"
+if [ -n "$busy" ]; then
+  echo "t: in use:$busy -- nothing started."
+  exit 1
+fi
+
+# Background children of a script ignore Ctrl+C (SIGINT); this shell gets
+# it and stops them with TERM. Closing the terminal (HUP) does the same.
+trap stop_all INT TERM HUP
+
+run_pages </dev/null & NAMES[$!]=pages
+run_relay </dev/null & NAMES[$!]=relay
+
+if [ -n "${POCA_SECRET:-}" ]; then auth="authentication on"; else auth="authentication OFF (--no-auth)"; fi
+echo "t: up -- ${NAMES[*]}  http://127.0.0.1:4001/main.html  ($auth; logs /tmp/tezcatl-{http,relay}.log). Ctrl+C stops both."
+
+# Report a service that ends on its own (the other keeps running); return
+# when none is left.
+while [ "${#NAMES[@]}" -gt 0 ]; do
+  if wait -n -p done_pid "${!NAMES[@]}" 2>/dev/null; then status=0; else status=$?; fi
+  [ -z "${done_pid:-}" ] && break
+  echo "t: ${NAMES[$done_pid]} ended (status $status) -- see its log"
+  unset "NAMES[$done_pid]"
+  done_pid=""
+done
+echo "t: everything has ended"
